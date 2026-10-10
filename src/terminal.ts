@@ -8,7 +8,10 @@ const HELP = `calx — math scratchpad on a Python kernel
   <k>~ expr ; expr</k>       plot              ~ sin x ; x^2 + y^2 = 9
 
   calculator lines accept  ^  for powers, implicit multiplication (2x, sin x), π, √
-  everything else is regular Python with sympy imported (x y z t n k a b c are symbols)
+  everything else is regular Python. kernels:
+    python3   your own interpreter: pip packages, files, network. plain Python namespace;
+              ⌘. raises KeyboardInterrupt and keeps your variables
+    pyodide   built-in fallback (WebAssembly); sympy is pre-imported, x y z t … are symbols
 
   <k>plot(*items, x=(a, b), y=(c, d), hold=True)</k>   functions, "y = ...", implicit,
                                                 (fx, fy) parametric, xs, ys data
@@ -16,15 +19,20 @@ const HELP = `calx — math scratchpad on a Python kernel
   <k>diff integrate limit series solve factor expand simplify Matrix</k>  — sympy
   <k>import numpy, matplotlib</k>  packages load on first import; plt figures show inline
 
-  editor   ⌘↵ run block   ⇧↵ run line   ⌘⇧↵ run all   ⌘. stop/restart   ⌘K clear
+  editor   ⌘↵ run block   ⇧↵ run line   ⌘⇧↵ run all   ⌘. interrupt   ⌘K clear
   graph    drag to pan · scroll/pinch to zoom · double-click to reset
-  prompt   :help  :clear  :restart  ↑/↓ history`;
+  prompt   ↑/↓ history  ·  input() answers here (^D = EOF)
+           :help  :clear  :restart
+           :kernel native|pyodide   switch between your python3 and the built-in one
+           :python /path/to/python  use a specific interpreter (venv, conda…); :python resets`;
 
 /** Scrollback log plus a one-line prompt at the bottom. */
 export class Terminal {
   private history: string[] = [];
   private histPos = 0;
   private entries = new Map<number, HTMLElement>();
+  private asking: { id: number; prompt: string; reply: (value: string | null) => void } | null = null;
+  private ps1: HTMLElement;
 
   constructor(
     private log: HTMLElement,
@@ -38,6 +46,7 @@ export class Terminal {
       this.history = [];
     }
     this.histPos = this.history.length;
+    this.ps1 = input.parentElement!.querySelector(".ps1")!;
     input.addEventListener("keydown", (e) => this.key(e));
     log.addEventListener("mouseup", () => {
       if (!window.getSelection()?.toString()) input.focus();
@@ -45,6 +54,16 @@ export class Terminal {
   }
 
   private key(e: KeyboardEvent) {
+    if (this.asking && (e.key === "Enter" || (e.ctrlKey && e.key === "d"))) {
+      e.preventDefault();
+      const { id, prompt, reply } = this.asking;
+      const value = e.key === "Enter" ? this.input.value : null;
+      this.input.value = "";
+      this.endAsk();
+      this.write(id, "out", prompt + (value ?? "^D"));
+      reply(value);
+      return;
+    }
     if (e.key === "Enter") {
       const line = this.input.value;
       this.input.value = "";
@@ -130,7 +149,22 @@ export class Terminal {
     });
   }
 
+  /** Python called input(): the prompt line answers it instead of running code. */
+  ask(id: number, prompt: string, reply: (value: string | null) => void) {
+    this.asking = { id, prompt, reply };
+    this.ps1.textContent = prompt.trimEnd() || "input ❯";
+    this.ps1.classList.add("asking");
+    this.input.focus();
+  }
+
+  endAsk() {
+    this.asking = null;
+    this.ps1.textContent = "calx ❯";
+    this.ps1.classList.remove("asking");
+  }
+
   done(id: number, ok: boolean, ms: number) {
+    if (this.asking?.id === id) this.endAsk();
     this.stick(() => {
       const entry = this.target(id);
       if (!ok || ms > 300) {

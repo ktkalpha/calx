@@ -3,6 +3,7 @@ import { createEditor } from "./editor";
 import { Graph } from "./graph";
 import { Kernel, type KernelState } from "./kernel/client";
 import type { FromKernel } from "./kernel/protocol";
+import { inTauri, type KernelKind } from "./kernel/transports";
 import { Terminal } from "./terminal";
 
 const WELCOME = `# calx — ⌘↵ runs the block under the cursor, ⇧↵ runs one line
@@ -16,7 +17,10 @@ const WELCOME = `# calx — ⌘↵ runs the block under the cursor, ⇧↵ runs 
 
 ~ sin(x) ; x^2/8 - 3 ; x^2 + y^2 = 16
 
-# regular python works too
+# plain python works too
+import sys
+print(sys.version)
+
 def collatz(n):
     steps = 0
     while n != 1:
@@ -26,7 +30,7 @@ def collatz(n):
 
 plot(list(range(1, 60)), [collatz(i) for i in range(1, 60)], title="collatz")
 
-series(exp(x) * cos(x), x, 0, 6)
+= series(exp(x) * cos(x), x, 0, 6)
 `;
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -61,7 +65,33 @@ const terminal = new Terminal(
   (spec) => graph.show({ ...spec, hold: false }),
 );
 
-const kernel = new Kernel(onKernel, setStatus);
+// The desktop app runs the user's own python3; the browser build (and a Mac without
+// python3) falls back to the built-in pyodide kernel.
+let everReady = false;
+const savedKind = load("calx.kernel", "native") as KernelKind;
+const kernel = new Kernel(
+  inTauri() ? savedKind : "pyodide",
+  load("calx.python", "") || null,
+  onKernel,
+  setStatus,
+  onCrash,
+);
+
+function onCrash(reason: string, kind: KernelKind) {
+  terminal.endAsk();
+  if (kind === "native") {
+    terminal.system(`python3 kernel stopped: ${reason}`);
+    if (!everReady) {
+      terminal.system("falling back to the built-in pyodide kernel  (:kernel native to retry)");
+      kernel.restart("pyodide");
+    } else {
+      terminal.system("type :restart to start it again");
+    }
+  } else {
+    terminal.system(`kernel crashed: ${reason}  (:restart to start again)`);
+  }
+}
+
 
 const graph = new Graph(
   $("#graph"),
@@ -73,7 +103,20 @@ const graph = new Graph(
 function onKernel(msg: FromKernel) {
   switch (msg.type) {
     case "ready":
-      terminal.system(`calx · python ${msg.python} · pyodide ${msg.version} · ready in ${(msg.ms / 1000).toFixed(1)}s`);
+      everReady = true;
+      if (msg.kernel === "native") {
+        terminal.system(`calx · python ${msg.python} · ${msg.executable}`);
+        if (msg.missing?.length)
+          terminal.system(
+            `note: ${msg.missing.join(", ")} not installed for this python — "= …" and "~ …" lines need it:\n` +
+              `  ${msg.executable} -m pip install ${msg.missing.join(" ")}`,
+          );
+      } else {
+        terminal.system(`calx · python ${msg.python} · pyodide ${msg.version} · ready in ${(msg.ms / 1000).toFixed(1)}s`);
+      }
+      break;
+    case "input_request":
+      terminal.ask(msg.id, msg.prompt, (value) => kernel.input(value));
       break;
     case "fatal":
       terminal.system(`kernel failed to start:\n${msg.text}`);
@@ -114,11 +157,27 @@ function runCode(code: string) {
 }
 
 function stop() {
-  if (kernel.state === "booting") return;
-  kernel.restart();
+  terminal.endAsk();
+  const result = kernel.interrupt();
+  if (result === "restarted") afterRestart("kernel restarted — the built-in kernel can't be interrupted, variables were cleared");
+}
+
+function restart(kind: KernelKind = kernel.kind, python = kernel.python) {
+  terminal.endAsk();
+  kernel.restart(kind, python);
+  afterRestart(`restarting ${kind === "native" ? "python3" : "pyodide"} kernel — variables were cleared`);
+}
+
+function afterRestart(note: string) {
   graph.clear();
   $("#graph-title").textContent = "";
-  terminal.system("kernel restarted — variables were cleared");
+  terminal.system(note);
+}
+
+function switchKernel(kind: KernelKind) {
+  if (kind === "native" && !inTauri()) return terminal.system("the python3 kernel needs the desktop app");
+  save("calx.kernel", kind);
+  restart(kind);
 }
 
 function submit(line: string) {
@@ -126,7 +185,20 @@ function submit(line: string) {
   if (!cmd) return;
   if (cmd === ":help" || cmd === "help") return terminal.help();
   if (cmd === ":clear" || cmd === "clear") return terminal.clear();
-  if (cmd === ":restart") return stop();
+  if (cmd === ":restart") return restart();
+  const [head, ...rest] = cmd.split(/\s+/);
+  if (head === ":kernel") {
+    const kind = rest[0];
+    if (kind === "native" || kind === "pyodide") return switchKernel(kind);
+    return terminal.system(`kernel: ${kernel.kind}   usage: :kernel native | :kernel pyodide`);
+  }
+  if (head === ":python") {
+    const path = rest.join(" ").trim() || null;
+    save("calx.python", path ?? "");
+    terminal.system(path ? `using ${path}` : "using python3 from your PATH");
+    save("calx.kernel", "native");
+    return inTauri() ? restart("native", path) : terminal.system("the python3 kernel needs the desktop app");
+  }
   runCode(line);
 }
 
@@ -147,10 +219,14 @@ $("#graph-reset").addEventListener("click", () => graph.reset());
 $("#graph-zoom-in").addEventListener("click", () => graph.zoom(1 / 1.5));
 $("#graph-zoom-out").addEventListener("click", () => graph.zoom(1.5));
 $("#term-clear").addEventListener("click", () => terminal.clear());
+statusEl.addEventListener("click", () => {
+  if (inTauri()) switchKernel(kernel.kind === "native" ? "pyodide" : "native");
+});
 
 // global shortcuts that should work outside the editor too
 window.addEventListener("keydown", (e) => {
-  if (!(e.metaKey || e.ctrlKey)) return;
+  // the editor handles its own shortcuts and marks them defaultPrevented
+  if (!(e.metaKey || e.ctrlKey) || e.defaultPrevented) return;
   if (e.key === ".") {
     e.preventDefault();
     stop();

@@ -151,3 +151,6 @@ kbd { font-family: var(--mono); color: var(--fg); background: var(--bg-3); borde
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+.ps1.asking { color: var(--amber); }
+#kernel-status { cursor: pointer; }
+#kernel-status:hover span { color: var(--fg); }

@@ -1,5 +1,7 @@
-# calx kernel prelude — runs once when the Python kernel starts.
-# Everything defined here is visible in the user's namespace.
+# calx kernel prelude — shared by both kernels.
+#   pyodide: executed in the user's globals, so sympy and the helpers are visible directly.
+#   native:  executed in a private module; the user gets a clean __main__ plus plot/scatter.
+# sympy is optional (a system Python may not have it); only = / ~ and symbolic plots need it.
 import json as _json
 import math as _math
 import os as _os
@@ -10,18 +12,34 @@ import traceback as _traceback
 _os.environ.setdefault("MPLBACKEND", "Agg")
 
 import calx_js as _js
-from sympy import *  # noqa: F401,F403
-from sympy.parsing.sympy_parser import (
-    convert_xor as _convert_xor,
-    implicit_multiplication_application as _implicit,
-    parse_expr as _parse_expr,
-    standard_transformations as _std,
-)
 
-x, y, z, t, n, k, a, b, c = symbols("x y z t n k a b c")
-f, g, h = symbols("f g h", cls=Function)
+try:
+    from sympy import *  # noqa: F401,F403
+    from sympy.matrices import MatrixBase
+    from sympy.parsing.sympy_parser import (
+        convert_xor as _convert_xor,
+        implicit_multiplication_application as _implicit,
+        parse_expr as _parse_expr,
+        standard_transformations as _std,
+    )
 
-_TRANSFORMS = _std + (_implicit, _convert_xor)
+    x, y, z, t, n, k, a, b, c = symbols("x y z t n k a b c")
+    f, g, h = symbols("f g h", cls=Function)
+    _TRANSFORMS = _std + (_implicit, _convert_xor)
+    _HAS_SYMPY = True
+except ImportError:
+    # empty tuples make every isinstance(..., Basic) check simply False
+    Basic = MatrixBase = Equality = ()
+    _HAS_SYMPY = False
+
+
+def _need_sympy():
+    if not _HAS_SYMPY:
+        raise ImportError(
+            f"this needs sympy, which isn't installed for {_sys.executable}\n"
+            f"  install it with:  {_sys.executable} -m pip install sympy"
+        )
+
 _PALETTE = ["#7ee787", "#79c0ff", "#f0b45b", "#ff7b72", "#d2a8ff", "#56d4dd", "#ffa198", "#e3b341"]
 _series_registry = {}
 _series_counter = [0]
@@ -74,6 +92,7 @@ def _show(value):
 
 
 def _parse(src):
+    _need_sympy()
     src = src.strip().replace("π", "pi").replace("√", "sqrt ").replace("·", "*").replace("×", "*")
     return _parse_expr(src, transformations=_TRANSFORMS, local_dict=_user_ns())
 
@@ -348,7 +367,7 @@ def _make_series(obj, xmin, xmax, ymin, ymax, trange, n, color):
         for e in (ex, ey):
             if isinstance(e, Basic):
                 syms |= e.free_symbols
-        var = sorted(syms, key=str)[0] if syms else Symbol("t")
+        var = sorted(syms, key=str)[0] if syms else None
         fx = _lambdify1(var, ex) if isinstance(ex, Basic) else ex
         fy = _lambdify1(var, ey) if isinstance(ey, Basic) else ey
         t0, t1 = (float(v) for v in trange)
@@ -365,6 +384,7 @@ def _make_series(obj, xmin, xmax, ymin, ymax, trange, n, color):
         sampler = lambda view, npts: _sample_fn(fn, view["xmin"], view["xmax"], npts)  # noqa: E731
         return _register("fn", _label(obj), sampler, _sample_fn(fn, xmin, xmax, n), True, color)
 
+    _need_sympy()
     obj = sympify(obj)
     if isinstance(obj, Equality):
         free = obj.free_symbols
@@ -458,22 +478,48 @@ def _transform(code):
     return "\n".join(out)
 
 
+_SRC = [""]
+
+
+def _prepare(code):
+    """Rewrite calx syntax to Python and get matplotlib ready if the code uses it."""
+    src = _transform(code)
+    _SRC[0] = code  # 1:1 line mapping, so tracebacks can quote the original
+    if "matplotlib" in src:
+        try:
+            import matplotlib  # noqa: F401
+            import matplotlib.pyplot  # noqa: F401
+
+            _patch_matplotlib()
+        except ImportError:
+            pass
+    return src
+
+
+def _finish(value):
+    _show(value)
+    _flush_figures()
+
+
+def _fail(e):
+    try:
+        _flush_figures()
+    except Exception:
+        pass
+    _emit("error", text=_format_exc(e))
+
+
 async def _run(code):
+    """pyodide runner (supports top-level await)."""
     from pyodide.code import eval_code_async
 
     try:
-        src = _transform(code)
-        if "matplotlib" in src:
-            import matplotlib  # noqa: F401
-            import matplotlib.pyplot  # noqa: F401
-            _patch_matplotlib()
+        src = _prepare(code)
         value = await eval_code_async(src, _NS, filename="<calx>")
-        _show(value)
-        _flush_figures()
+        _finish(value)
         return True
     except BaseException as e:  # noqa: BLE001
-        _flush_figures()
-        _emit("error", text=_format_exc(e))
+        _fail(e)
         return False
 
 
@@ -487,7 +533,12 @@ def _format_exc(e):
         lines.append(f"SyntaxError: {e.msg}")
         return "\n".join(l for l in lines if l)
     frames = [fr for fr in _traceback.extract_tb(e.__traceback__) if fr.filename == "<calx>"]
-    parts = [f"  line {fr.lineno}, in {fr.name}" for fr in frames[-3:]]
+    lines = _SRC[0].split("\n")
+    parts = []
+    for fr in frames[-3:]:
+        where = f"  line {fr.lineno}" + ("" if fr.name == "<module>" else f", in {fr.name}")
+        text = lines[fr.lineno - 1].strip() if fr.lineno and fr.lineno <= len(lines) else ""
+        parts.append(f"{where}:  {text}" if text else where)
     parts.append(f"{type(e).__name__}: {e}")
     return "\n".join(parts)
 

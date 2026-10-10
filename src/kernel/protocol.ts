@@ -27,11 +27,20 @@ export interface PlotSpec {
 
 export type ToKernel =
   | { type: "run"; id: number; code: string }
+  | { type: "input"; value?: string; eof?: boolean }
   | { type: "sample"; reqId: number; ids: string[]; view: Required<{ [K in keyof View]: number }>; n: number };
 
 export type FromKernel =
   | { type: "status"; text: string }
-  | { type: "ready"; version: string; python: string; ms: number }
+  | {
+      type: "ready";
+      kernel?: "native" | "pyodide";
+      version: string;
+      python: string;
+      ms: number;
+      executable?: string;
+      missing?: string[];
+    }
   | { type: "fatal"; text: string }
   | { type: "stdout"; id: number; text: string }
   | { type: "stderr"; id: number; text: string }
@@ -40,5 +49,6 @@ export type FromKernel =
   | { type: "image"; id: number; src: string }
   | { type: "plot"; id: number; plot: PlotSpec }
   | { type: "help"; id: number }
+  | { type: "input_request"; id: number; prompt: string }
   | { type: "done"; id: number; ok: boolean; ms: number }
   | { type: "samples"; reqId: number; series: Series[] };
